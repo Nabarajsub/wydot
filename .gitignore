@@ -9,3 +9,4 @@ __pycache__/
 *.csv
 *.pdf
 *.docx
+.env
