@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+langchain
+langchain-openai
+langchain-experimental
+langchain-community
+pymilvus
+python-dotenv
+redis
+langchain-huggingface
+sentence-transformers
+tiktoken
+langchain_groq
