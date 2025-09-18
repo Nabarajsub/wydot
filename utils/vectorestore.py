@@ -13,9 +13,8 @@ port = os.getenv('PORT', '19530')
 embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
 # Load PDF and split into documents
-pdf_loader = PyPDFLoader('/Users/uw-user/Desktop/WYDOT/Data/Engineering and technical program/WYDOT Standard Specifications – 2021 Edition (Road & Bridge Construction)/Wyoming 2021 Standard Specifications for Road and Bridge Construction.pdf')
-pdf_docs = pdf_loader.load_and_split()
-
+pdf_loader = PyPDFLoader('C:\\Users\\nsubedi1\\Desktop\\WYDOT project\\data\\Wyoming 2021 Standard Specifications for Road and Bridge Construction.pdf')
+pdf_docs = pdf_loader.load()  # Load the documents from the PDF
 # Create Milvus vector store from PDF documents
 pdf_vectorstore = Milvus.from_documents(
     pdf_docs,

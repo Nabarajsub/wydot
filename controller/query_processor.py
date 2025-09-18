@@ -184,94 +184,111 @@ async def query_processor(**request_params):
         return {"result": "Failed to process the query."}
 
 
+import os
+from dotenv import load_dotenv
 
-# import os
-# from dotenv import load_dotenv
-# from langchain_groq import ChatGroq
-# from langchain.embeddings import HuggingFaceEmbeddings
-# from langchain.vectorstores.milvus import Milvus
-# from langchain.prompts import ChatPromptTemplate
-# from langchain.schema.runnable import RunnableMap
-# from langchain.schema.output_parser import StrOutputParser
+# Vector store / embeddings
+from langchain.embeddings import HuggingFaceEmbeddings
+from langchain.vectorstores.milvus import Milvus
 
-# load_dotenv()
+# Google Gemini
+import google.generativeai as genai
 
-# # --- Environment variables ---
-# host = os.getenv('HOST', 'localhost')
-# port = os.getenv('PORT', '19530')
-# groq_api_key = os.getenv('GROQ_API_KEY')
-# collection_name = os.getenv('MILVUS_COLLECTION', 'wyodotspecs')  # must match the created collection
+load_dotenv()
 
-# # --- LLM initialization ---
-# llm = ChatGroq(
-#     model="llama-3.3-70b-versatile",
-#     temperature=0,
-#     api_key=groq_api_key
-# )
+# --- Environment ---
+host = os.getenv("HOST", "localhost")
+port = os.getenv("PORT", "19530")
+collection_name = os.getenv("MILVUS_COLLECTION", "wyodotspecs")
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
-# # --- Embeddings ---
-# embeddings = HuggingFaceEmbeddings(
-#     model_name="sentence-transformers/all-MiniLM-L6-v2",
-#     encode_kwargs={"normalize_embeddings": True}
-# )
+# --- Embeddings & Vectorstore ---
+embeddings = HuggingFaceEmbeddings(
+    model_name="sentence-transformers/all-MiniLM-L6-v2",
+    encode_kwargs={"normalize_embeddings": True},
+)
 
-# # --- Connect to existing Milvus collection ---
-# database = Milvus(
-#     embeddings,
-#     connection_args={'host': host, 'port': port},
-#     collection_name=collection_name,
-#     vector_field="embedding"
-# )
 
-# # Use as retriever for cleaner integration
-# retriever = database.as_retriever(search_kwargs={"k": 5})
+def _retrieve_context(query: str, k: int = 5):
+    """Retrieve top-k chunks from Milvus and combine into a single context string."""
+    docs = database.similarity_search(query, k=k)
+    context_text = "\n\n".join(d.page_content for d in docs if d.page_content)
+    # Expose lightweight citations (page number if present)
+    sources = [
+        {
+            "page": d.metadata.get("page"),
+            "source": d.metadata.get("source") or d.metadata.get("file"),
+            "preview": (d.page_content or "")[:300],
+        }
+        for d in docs
+    ]
+    return context_text, sources
 
-# # --- Output parser ---
-# output_parser = StrOutputParser()
+def _make_parts(query: str, context_text: str, extracted_text: str, uploads: list):
+    """Build Gemini multimodal parts."""
+    parts = []
+    # 1) Vectorstore context
+    if context_text:
+        parts.append({"text": f"CONTEXT (from vectorstore):\n{context_text}"})
+    # 2) Any OCR/STT/doc text extracted from uploaded files
+    if extracted_text:
+        parts.append({"text": f"UPLOADED DOC/TEXT CONTEXT:\n{extracted_text}"})
+    # 3) Raw media (image/audio/video) as bytes
+    if uploads:
+        for item in uploads:
+            b = item.get("bytes")
+            mime = item.get("mime") or "application/octet-stream"
+            if not b:
+                continue
+            parts.append({"inline_data": {"mime_type": mime, "data": b}})
+    # 4) The user’s question
+    if query:
+        parts.append({"text": f"QUESTION:\n{query}"})
+    # 5) System-like guidance
+    parts.insert(
+        0,
+        {
+            "text": (
+                "You are WYDOT’s helpful assistant. Answer ONLY using the provided "
+                "context (vectorstore + uploaded materials).Ensure clarity, brevity, and human-like responses. If the answer is not "
+                "contained, answer it based on your role. Be concise and clear."
+            )
+        },
 
-# # --- Prompt Template ---
-# template = """
-# You are WYDOT chatbot, a polite and helpful Virtual Assistant of Wyoming Department of Transportation (WYDOT).
-# Answer the question from the given context. Ensure clarity, brevity, and human-like responses.
-# Context inside double backticks:``{context}```
-# Question inside triple backticks:```{question}```
-# If question is out of scope, answer it based on your role.
-# Provide answers in a complete sentence concisely, within 50 words.
-# JUST PROVIDE THE ANSWER IN ENGLISH WITHOUT ``` AND NOTHING ELSE.
-# """
-# prompt = ChatPromptTemplate.from_template(template)
+       
+    )
+    return parts
 
-# # --- Helper: fetch context text only ---
-# def fetch_context(query: str):
-#     docs = retriever.get_relevant_documents(query)
-#     # Join top-k chunks into a single context block
-#     combined_text = "\n\n".join(d.page_content for d in docs)
-#     return combined_text, docs
+def _run_gemini(parts: list, model_name: str = "gemini-2.5-flash") -> str:
+    model = genai.GenerativeModel(model_name)
+    resp = model.generate_content(parts)
+    return (resp.text or "").strip()
 
-# # --- Runnable chain ---
-# chain = RunnableMap({
-#     "context": lambda x: fetch_context(x["question"])[0],
-#     "question": lambda x: x["question"]
-# }) | prompt | llm | output_parser
+def resultDocuments(query: str, extracted_text: str = "", uploads: list = None, model: str = "gemini-2.5-flash"):
+    uploads = uploads or []
+    context_text, sources = _retrieve_context(query)
+    parts = _make_parts(query=query, context_text=context_text, extracted_text=extracted_text, uploads=uploads)
+    answer = _run_gemini(parts, model_name=model)
+    return {"text": answer, "sources": sources}
 
-# # --- Function to handle single query ---
-# def resultDocuments(query: str):
-#     result = chain.invoke({'question': query})
-#     return {"text": result}
+# --- Async entry for FastAPI calls ---
+async def query_processor2(**request_params):
+    query = request_params.get("query", "").strip()
+    model = (request_params.get("model") or "gemini-2.5-flash").strip()
+    uploads = request_params.get("uploads") or []
+    extracted_text = request_params.get("extracted_text", "")
 
-# # --- Async query processor for API calls ---
-# async def query_processor(**request_params):
-#     query = request_params.get('query', '')
-#     if not query:
-#         return {"result": "No query provided."}
+    if not query and not extracted_text and not uploads:
+        return {"result": "No query or content provided."}
 
-#     try:
-#         response = resultDocuments(query)
-#         context_text, context_docs = fetch_context(query)
-#         return {
-#             "response": response, 
-#             "context": [{"page": d.metadata.get("page"), "text": d.page_content[:300]} for d in context_docs]
-#         }
-#     except Exception as error:
-#         print("Error processing query:", error)
-#         return {"result": "Failed to process the query."}
+    try:
+        reply = resultDocuments(query=query, extracted_text=extracted_text, uploads=uploads, model=model)
+        return {
+            "response": reply["text"],
+            "sources": reply["sources"],
+            "used_model": model,
+        }
+    except Exception as e:
+        print("Error processing query:", e)
+        return {"result": "Failed to process the query."}
+

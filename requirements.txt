@@ -11,3 +11,13 @@ langchain-huggingface
 sentence-transformers
 tiktoken
 langchain_groq
+pypdf
+python-multipart
+Pillow
+python-docx
+PyPDF2
+speech
+google-generativeai
+google-genai
+pydub
+pdf2image
