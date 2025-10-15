@@ -9,143 +9,66 @@ import threading
 from typing import List, Dict, Any, Optional, Tuple
 
 import streamlit as st
-import streamlit.components.v1 as components  # NEW: tiny JS for smooth scroll
-
+import streamlit.components.v1 as components
 from dotenv import load_dotenv
 
-# ---- RAG libs ----
-from langchain.embeddings import HuggingFaceEmbeddings
-from langchain.vectorstores.milvus import Milvus
+# ---- Google GenAI: tuned model (chat) ----
+import google.generativeai as genai_chat
 
-# ---- LLM Providers (optional imports) ----
-import google.generativeai as genai
+# ---- Google GenAI: embeddings (query vectors) ----
+from google import genai as genai_embed
+from google.genai import types as genai_types
 
-try:
-    from openai import OpenAI
-    _HAS_OPENAI = True
-except Exception:
-    _HAS_OPENAI = False
-    OpenAI = None  # type: ignore
-
-try:
-    from groq import Groq
-    _HAS_GROQ = True
-except Exception:
-    _HAS_GROQ = False
-    Groq = None  # type: ignore
-
+# ---- Milvus (direct) ----
+from pymilvus import connections, utility, Collection
 
 # =========================
 # ENV + CONFIG
 # =========================
 load_dotenv()
 
-HOST = os.getenv("HOST", "localhost")
+HOST = os.getenv("HOST", "127.0.0.1")
 PORT = int(os.getenv("PORT", "19530"))
-COLLECTION_NAME = os.getenv("MILVUS_COLLECTION", "wyodotspecs")
-
-# Default Gemini model
-GEMINI_MODEL_DEFAULT = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+COLLECTION_NAME = os.getenv("MILVUS_COLLECTION", "wydotspec_llamaparse")
 
 CHAT_DB_PATH = os.getenv("CHAT_DB_PATH", "./chat_history.sqlite3")
 
-# API keys
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+# Tuned Vertex/AI-Studio model + key
+TUNED_MODEL_ID = os.getenv("WYDOT_TUNED_MODEL_ID", "tunedModels/wydot-chat-flash-2.5")
+WYDOT_FLASH_API_KEY = os.getenv("WYDOT_FLASH_API_KEY")
+if not WYDOT_FLASH_API_KEY:
+    raise RuntimeError("Missing WYDOT_FLASH_API_KEY in environment.")
+
+# Configure chat model
+genai_chat.configure(api_key=WYDOT_FLASH_API_KEY)
+
+# Embedding model config (should match what you used to build the collection)
+EMBED_MODEL = os.getenv("GEMINI_EMBED_MODEL", "gemini-embedding-001")
+
+# Prefer GEMINI/GOOGLE_API_KEY for embeddings; fallback to WYDOT_FLASH_API_KEY if needed
+_EMBED_KEY = (
+    os.getenv("GEMINI_API_KEY")
+    or os.getenv("GOOGLE_API_KEY")
+    or WYDOT_FLASH_API_KEY
+)
+
+# Vertex option for embeddings (optional)
+_USE_VERTEX = os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "").strip().lower() in {"1", "true", "yes", "on"}
+_PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("PROJECT_ID")
+_LOCATION = os.getenv("GOOGLE_CLOUD_LOCATION") or os.getenv("VERTEX_LOCATION") or "us-central1"
 
 # How much recent chat to include each LLM turn
 MAX_HISTORY_MSGS = 20
 HISTORY_PAIRS_FOR_PROMPT = 6
 
-
-# =========================
-# MODEL ROUTER
-# =========================
-# Map the user-friendly labels to (provider, actual_model_id)
-MODEL_CATALOG = {
-    "Gemini 2.5 Pro":        ("gemini", "gemini-2.5-pro"),
-    "Gemini 2.5 Flash":      ("gemini", "gemini-2.5-flash"),
-    "Gemini 2.5 Flash-Lite": ("gemini", "gemini-2.5-flash-lite"),
-
-    "GPT-5":         ("openai", "gpt-5"),
-    "GPT-5 mini":    ("openai", "gpt-5-mini"),
-    # user wrote "04-mini"; normalize to "o4-mini"
-    "o4-mini":       ("openai", "o4-mini"),
-    "GPT-4.1 mini":  ("openai", "gpt-4.1-mini"),
-
-    "llama-3.3-70b-versatile": ("groq", "llama-3.3-70b-versatile"),
-}
-
-# Back-compat aliases (if someone sets the env default to old style names)
-ALIAS_NORMALIZE = {
-    "04-mini": "o4-mini",
-    "gpt-4.1 mini": "gpt-4.1-mini",
-    "gemini-2.5-pro": "Gemini 2.5 Pro",
-    "gemini-2.5-flash": "Gemini 2.5 Flash",
-    "gemini-2.5-flash-lite": "Gemini 2.5 Flash-Lite",
-}
-
-
-def resolve_model(label_or_id: str) -> Tuple[str, str]:
-    """
-    Return (provider, model_id) based on a UI label or raw model id.
-    """
-    key = label_or_id.strip()
-    key = ALIAS_NORMALIZE.get(key, key)
-
-    if key in MODEL_CATALOG:
-        return MODEL_CATALOG[key]
-
-    # If a raw Gemini id is passed
-    if key.startswith("gemini-"):
-        return ("gemini", key)
-    # OpenAI quick heuristic
-    if key.startswith(("gpt-", "o4-")):
-        return ("openai", key)
-    # Groq llama heuristic
-    if "llama" in key:
-        return ("groq", key)
-
-    # Fallback to Gemini default
-    return ("gemini", GEMINI_MODEL_DEFAULT)
-
-
-# =========================
-# EMBEDDINGS + VECTORSTORE
-# =========================
-@st.cache_resource(show_spinner=False)
-def get_embeddings():
-    return HuggingFaceEmbeddings(
-        model_name="sentence-transformers/all-MiniLM-L6-v2",
-        encode_kwargs={"normalize_embeddings": True},
-    )
-
-@st.cache_resource(show_spinner=False)
-def get_vectorstore(host: str, port: int, collection: str):
-    try:
-        vs = Milvus(
-            embedding_function=get_embeddings(),
-            collection_name=collection,
-            connection_args={"host": host, "port": port},
-            vector_field="embedding"  # Specify your correct vector field name
-        )
-        return vs
-    except Exception as e:
-        st.error(f"Milvus init error: {e}")
-        return None
-
-database: Optional[Milvus] = get_vectorstore(HOST, PORT, COLLECTION_NAME)
-
+VECTOR_FIELD = "vector"     # <— your field name from the builder
+METRIC_TYPE = "COSINE"      # you used COSINE in your builder script
 
 # =========================
 # SQLITE CHAT STORE
 # =========================
 class ChatHistoryStore:
-    """
-    SQLite store for chat history.
-    Schema: messages(session_id TEXT, role TEXT('user'|'assistant'), content TEXT, ts REAL)
-    """
+    """SQLite store for chat history."""
     def __init__(self, db_path: str):
         self.db_path = db_path
         self._lock = threading.Lock()
@@ -211,28 +134,150 @@ def get_history_text(session_id: str, max_pairs: int = HISTORY_PAIRS_FOR_PROMPT)
         lines.append(f"{prefix}: {m['content']}")
     return "\n".join(lines)
 
+# =========================
+# Milvus connect + dimension probe
+# =========================
+@st.cache_resource(show_spinner=False)
+def get_milvus_collection(host: str, port: int, collection: str) -> Tuple[Optional[Collection], Optional[int]]:
+    try:
+        connections.connect(alias="default", host=host, port=str(port))
+    except Exception as e:
+        st.error(f"Milvus connect error: {e}")
+        return None, None
+
+    if not utility.has_collection(collection):
+        st.error(f"Milvus collection not found: {collection}")
+        return None, None
+
+    col = Collection(collection)
+    # load the collection for search
+    try:
+        col.load()
+    except Exception as e:
+        st.warning(f"Milvus load() warning: {e}")
+
+    # read vector dim from schema
+    dim = None
+    for f in col.schema.fields:
+        if f.name == VECTOR_FIELD:
+            # dim can be in f.params["dim"] or f.dim depending on version
+            dim = f.params.get("dim") if getattr(f, "params", None) else None
+            if dim is None:
+                dim = getattr(f, "dim", None)
+            if dim is not None:
+                dim = int(dim)
+            break
+
+    if dim is None:
+        st.error(f"Could not detect vector dimension for field '{VECTOR_FIELD}'.")
+        return None, None
+
+    return col, dim
 
 # =========================
-# RAG: RETRIEVAL + PROMPTS
+# Embedding helper (Gemini)
 # =========================
-def _retrieve_context(query: str, k: int = 5):
-    if not database:
-        return "", []
+@st.cache_resource(show_spinner=False)
+def get_embed_client():
+    if _USE_VERTEX:
+        if not _PROJECT:
+            raise RuntimeError("Set GOOGLE_CLOUD_PROJECT for Vertex AI embeddings.")
+        return genai_embed.Client(vertexai=True, project=_PROJECT, location=_LOCATION)
+    return genai_embed.Client(api_key=_EMBED_KEY)
+
+def _extract_values_any(resp) -> List[float]:
+    # Attribute-like
+    if hasattr(resp, "embedding") and getattr(resp.embedding, "values", None):
+        return [float(x) for x in resp.embedding.values]
+    if hasattr(resp, "embeddings") and getattr(resp, "embeddings", None):
+        e0 = resp.embeddings[0]
+        vals = getattr(e0, "values", None)
+        if vals is not None:
+            return [float(x) for x in vals]
+    # Dict-like fallback
+    if isinstance(resp, dict):
+        if "embedding" in resp and isinstance(resp["embedding"], dict) and "values" in resp["embedding"]:
+            return [float(x) for x in resp["embedding"]["values"]]
+        if "embeddings" in resp and isinstance(resp["embeddings"], list) and resp["embeddings"]:
+            e0 = resp["embeddings"][0]
+            if "values" in e0:
+                return [float(x) for x in e0["values"]]
+    # Last resort: JSON via SDK helper
     try:
-        docs = database.similarity_search(query, k=k)
-    except Exception as e:
-        st.warning(f"[Milvus] similarity_search error: {e}")
+        import json as _json
+        js = _json.loads(genai_types.to_json(resp))
+        return _extract_values_any(js)
+    except Exception:
+        pass
+    raise ValueError("Unexpected embedding response structure (no 'values' found).")
+
+def embed_query_vector(text: str, dim: int) -> List[float]:
+    client = get_embed_client()
+    resp = client.models.embed_content(
+        model=EMBED_MODEL,
+        contents=text,
+        config=genai_types.EmbedContentConfig(
+            output_dimensionality=dim,
+            task_type="RETRIEVAL_QUERY"
+        ),
+    )
+    vals = _extract_values_any(resp)
+    # Optional: L2 normalize for cosine
+    import math
+    n = math.sqrt(sum(v*v for v in vals))
+    if n > 0:
+        vals = [v / n for v in vals]
+    return vals
+
+# =========================
+# RAG: RETRIEVAL (direct Milvus)
+# =========================
+@st.cache_resource(show_spinner=False)
+def init_milvus(host: str, port: int, collection: str):
+    return get_milvus_collection(host, port, collection)
+
+def milvus_similarity_search(query: str, k: int = 5) -> Tuple[str, List[Dict[str, Any]]]:
+    col, dim = init_milvus(HOST, PORT, COLLECTION_NAME)
+    if not col or not dim:
         return "", []
-    context_text = "\n\n".join(d.page_content for d in docs if getattr(d, "page_content", None))
-    sources = [
-        {
-            "page": (d.metadata or {}).get("page"),
-            "source": (d.metadata or {}).get("source") or (d.metadata or {}).get("file"),
-            "preview": (d.page_content or "")[:300],
-        } for d in docs
-    ]
+
+    try:
+        qv = embed_query_vector(query, dim)
+    except Exception as e:
+        st.warning(f"[Embed] {e}")
+        return "", []
+
+    try:
+        res = col.search(
+            data=[qv],
+            anns_field=VECTOR_FIELD,
+            param={"metric_type": METRIC_TYPE, "params": {"ef": 64}},
+            limit=k,
+            output_fields=["doc_id", "chunk_id", "page", "section", "source", "content"],
+        )
+    except Exception as e:
+        st.warning(f"[Milvus search] {e}")
+        return "", []
+
+    chunks = []
+    sources = []
+    if res and len(res) > 0:
+        for hit in res[0]:
+            md = hit.entity
+            content = md.get("content") or ""
+            chunks.append(content)
+            sources.append({
+                "page": md.get("page"),
+                "source": md.get("source"),
+                "preview": (content[:300] if content else "")
+            })
+
+    context_text = "\n\n".join(chunks)
     return context_text, sources
 
+# =========================
+# Prompt composer
+# =========================
 def _make_parts(
     query: str,
     context_text: str,
@@ -243,7 +288,6 @@ def _make_parts(
     uploads = uploads or []
     parts: List[Dict[str, Any]] = []
 
-    # Compose the prompt using the provided template
     prompt = (
         "You are WYDOT chatbot, a polite and helpful Virtual Assistant of Wyoming Department of Transportation (WYDOT).\n"
         "Answer the question from the given context. Ensure clarity, brevity, and human-like responses.\n"
@@ -259,10 +303,8 @@ def _make_parts(
 
     if history_text:
         parts.append({"text": f"CHAT HISTORY (recent):\n{history_text}"})
-
     if context_text:
         parts.append({"text": f"CONTEXT (from vectorstore):\n{context_text}"})
-
     if extracted_text:
         parts.append({"text": f"UPLOADED DOC/TEXT CONTEXT:\n{extracted_text}"})
 
@@ -278,69 +320,36 @@ def _make_parts(
 
     return parts
 
-
 # =========================
-# LLM EXECUTION (multi-provider)
+# LLM call (single tuned model)
 # =========================
-def _parts_to_text(parts: List[Dict[str, Any]]) -> str:
-    """Flatten our Gemini-style parts into a plain text prompt for providers that need it."""
-    chunks = []
-    for p in parts:
-        if "text" in p:
-            chunks.append(p["text"])
-    return "\n\n".join(chunks)
+def _run_tuned_wydot(parts: List[Dict[str, Any]]) -> str:
+    """
+    Calls your tuned Flash 2.5 model via google.generativeai using WYDOT_FLASH_API_KEY.
+    """
+    try:
+        model = genai_chat.GenerativeModel(TUNED_MODEL_ID)
+        resp = model.generate_content(parts)
 
-def _run_gemini(parts: List[Dict[str, Any]], model_name: str) -> str:
-    model = genai.GenerativeModel(model_name)
-    resp = model.generate_content(parts)
-    return (getattr(resp, "text", "") or "").strip()
+        text = (getattr(resp, "text", "") or "").strip()
+        if text:
+            return text
 
-def _run_openai(parts: List[Dict[str, Any]], model_name: str) -> str:
-    if not _HAS_OPENAI:
-        st.error("OpenAI client not installed. Run: pip install openai")
-        return "OpenAI client not installed."
-    if not OPENAI_API_KEY:
-        st.error("Missing OPENAI_API_KEY in environment.")
-        return "Missing OPENAI_API_KEY."
+        # Robust fallback if resp.text is empty
+        candidates = getattr(resp, "candidates", None)
+        if candidates:
+            for cand in candidates:
+                content = getattr(cand, "content", None)
+                parts_list = getattr(content, "parts", None) if content else None
+                if parts_list:
+                    for p in parts_list:
+                        t = getattr(p, "text", None)
+                        if t:
+                            return t.strip()
 
-    client = OpenAI(api_key=OPENAI_API_KEY)
-    content_text = _parts_to_text(parts)
-    # Simple, text-only message for broad compatibility
-    resp = client.chat.completions.create(
-        model=model_name,
-        messages=[{"role": "user", "content": content_text}],
-        temperature=0.2,
-    )
-    return resp.choices[0].message.content.strip()
-
-def _run_groq(parts: List[Dict[str, Any]], model_name: str) -> str:
-    if not _HAS_GROQ:
-        st.error("Groq client not installed. Run: pip install groq")
-        return "Groq client not installed."
-    if not GROQ_API_KEY:
-        st.error("Missing GROQ_API_KEY in environment.")
-        return "Missing GROQ_API_KEY."
-
-    client = Groq(api_key=GROQ_API_KEY)
-    content_text = _parts_to_text(parts)
-    resp = client.chat.completions.create(
-        model=model_name,
-        messages=[{"role": "user", "content": content_text}],
-        temperature=0.2,
-    )
-    return resp.choices[0].message.content.strip()
-
-def _run_any_model(parts: List[Dict[str, Any]], selected_label_or_id: str) -> str:
-    provider, model_id = resolve_model(selected_label_or_id)
-    if provider == "gemini":
-        return _run_gemini(parts, model_id)
-    if provider == "openai":
-        return _run_openai(parts, model_id)
-    if provider == "groq":
-        return _run_groq(parts, model_id)
-    # Fallback
-    return _run_gemini(parts, GEMINI_MODEL_DEFAULT)
-
+        return "I couldn't generate an answer for that."
+    except Exception as e:
+        return f"[Model error] {e}"
 
 # =========================
 # PUBLIC PIPELINE
@@ -349,11 +358,10 @@ def resultDocuments(
     query: str,
     extracted_text: str = "",
     uploads: Optional[List[Dict[str, Any]]] = None,
-    model: str = GEMINI_MODEL_DEFAULT,
     session_id: str = "default",
 ):
     uploads = uploads or []
-    context_text, sources = _retrieve_context(query)
+    context_text, sources = milvus_similarity_search(query, k=5)
 
     history_text = get_history_text(session_id, max_pairs=HISTORY_PAIRS_FOR_PROMPT)
     if query:
@@ -367,13 +375,12 @@ def resultDocuments(
         history_text=history_text,
     )
 
-    answer = _run_any_model(parts, model)
+    answer = _run_tuned_wydot(parts)
 
     if answer:
         add_to_history(session_id, "assistant", answer)
 
     return {"text": answer, "sources": sources}
-
 
 # =========================
 # STREAMLIT UI
@@ -387,29 +394,17 @@ with st.sidebar:
     port = st.number_input("Milvus port", min_value=1, max_value=65535, value=PORT, step=1)
     collection = st.text_input("Milvus collection", COLLECTION_NAME)
 
-    # Build the model selector
-    all_labels = list(MODEL_CATALOG.keys())
-    # Ensure the default Gemini is in the list and selected
-    default_label = ALIAS_NORMALIZE.get(GEMINI_MODEL_DEFAULT, None)
-    default_index = 0
-    if default_label and default_label in all_labels:
-        default_index = all_labels.index(default_label)
-    elif "Gemini 2.5 Flash" in all_labels:
-        default_index = all_labels.index("Gemini 2.5 Flash")
-
-    selected_label = st.selectbox("Select Model", all_labels, index=default_index)
-
-    # Provider hints
-    prov, mid = resolve_model(selected_label)
-    if prov == "openai" and not OPENAI_API_KEY:
-        st.warning("OpenAI model selected, but OPENAI_API_KEY is not set.", icon="⚠️")
-    if prov == "groq" and not GROQ_API_KEY:
-        st.warning("Groq model selected, but GROQ_API_KEY is not set.", icon="⚠️")
-
-    st.caption("Change then click 'Reconnect' to re-init the vector store.")
     if st.button("🔄 Reconnect Milvus"):
-        globals()["database"] = get_vectorstore(host, port, collection)
+        # refresh cached connection/dim tuple
+        init_milvus.clear()
+        init_milvus(host, port, collection)
         st.success("Reconnected.")
+
+    st.markdown("---")
+    st.markdown("## 🤖 Model (fixed)")
+    st.write("Using tuned Gemini model:")
+    st.code(TUNED_MODEL_ID, language="text")
+    st.caption("Configured via WYDOT_FLASH_API_KEY")
 
     st.markdown("---")
     st.markdown("## 💬 Session")
@@ -440,8 +435,7 @@ col_chat, col_docs = st.columns([2, 1])
 
 with col_chat:
     st.markdown("### 🛣️ WyDOT employee bot")
-    st.markdown('<div id="chat_top"></div>', unsafe_allow_html=True)  # NEW: scroll anchor
-
+    st.markdown('<div id="chat_top"></div>', unsafe_allow_html=True)
 
     # Render chat history (scrolls with page)
     history_msgs = CHAT_DB.recent(st.session_state.get("session_id", "default"), limit=MAX_HISTORY_MSGS)
@@ -450,10 +444,8 @@ with col_chat:
             st.write(m["content"])
 
     # Chat input
-# Chat input
     user_query = st.chat_input("Ask something (e.g., 'PPE for bridge deck pour near traffic') …")
     if user_query:
-        # NEW: immediately show the just-typed question so it "remains" in the UI
         with st.chat_message("user"):
             st.write(user_query)
 
@@ -475,18 +467,15 @@ with col_chat:
                 query=user_query,
                 extracted_text=extracted_text,
                 uploads=uploads_payload,
-                model=selected_label,  # pass the label; router resolves it
                 session_id=st.session_state.get("session_id", "default"),
             )
 
-        # Show the assistant message
         with st.chat_message("assistant"):
             st.write(resp["text"])
 
-        # Save latest sources for right column display
         st.session_state["last_sources"] = resp.get("sources", [])
 
-        # NEW: smooth-scroll to the bottom after rendering both bubbles
+        # Smooth-scroll to the bottom after rendering both bubbles
         st.markdown('<div id="chat_bottom"></div>', unsafe_allow_html=True)
         components.html(
             """<script>
@@ -495,7 +484,8 @@ with col_chat:
             </script>""",
             height=0,
         )
-        # NEW: keep a bottom anchor so reruns also land at the latest message
+
+    # Keep a bottom anchor so reruns also land at the latest message
     st.markdown('<div id="chat_bottom"></div>', unsafe_allow_html=True)
     components.html(
         """<script>
@@ -505,8 +495,6 @@ with col_chat:
         height=0,
     )
 
-
-
 with col_docs:
     st.markdown("### 📚 Retrieved Documents")
     st.caption("Top-k chunks retrieved from Milvus for the latest question.")
@@ -514,7 +502,6 @@ with col_docs:
     if not sources:
         st.info("Ask a question to see retrieved documents here.")
     else:
-        # Show each retrieved doc in an expander
         for i, s in enumerate(sources, start=1):
             label = f"{i}. {s.get('source') or 'unknown'}"
             with st.expander(label, expanded=(i == 1)):

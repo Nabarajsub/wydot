@@ -20,14 +20,16 @@ async def response(query: Optional[str] = None,file: Optional[UploadFile] = None
     filename = file.filename.lower() if file else None
     content = await file.read() if file else None
     result = await query_processor(query=query)
+
+
+
+
     # return JSONResponse(content=result)
     return result
 
 
 
 
-
-    filename = file.filename.lower() if file else None
     content = await file.read() if file else None
     image = None
     audio = None
@@ -101,16 +103,7 @@ async def ask(
     model: Optional[str] = Form("gemini-2.5-flash"),
     files: Optional[List[UploadFile]] = File(None),
 ):
-    """
-    Accepts a user query and ANY mix of files (image/audio/video/PDF/DOCX).
-    Extracts text from docs, forwards raw media + extracted text to the processor.
-    """
-    if (not query) and (not files):
-        return JSONResponse({"error": "Provide a query and/or files."}, status_code=400)
-
-    extracted_texts: List[str] = []
-    uploads: List[dict] = []  # each: {"bytes": b"...", "mime": "image/png"} etc.
-
+    
     if files:
         recognizer = sr.Recognizer()
         for f in files:

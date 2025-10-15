@@ -45,7 +45,7 @@ MILVUS_SECURE = os.getenv("MILVUS_SECURE", "true").lower() in ("1","true","yes")
 COLLECTION_NAME = os.getenv("MILVUS_COLLECTION", "wyodotspecs_cloud")
 
 # Default Gemini model
-GEMINI_MODEL_DEFAULT = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL_DEFAULT = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-thinking-exp-001")
 
 CHAT_DB_PATH = os.getenv("CHAT_DB_PATH", "./chat_history.sqlite3")
 
@@ -491,6 +491,74 @@ with col_chat:
 
         # Save latest sources for right column display
         st.session_state["last_sources"] = resp.get("sources", [])
+# #with col_chat:
+#     st.markdown("### 🛣️ WyDOT employee bot")
+
+#     # A container to render all chat messages ABOVE the input form
+#     messages_box = st.container()
+
+#     # --- Render chat history into the container ---
+#     history_msgs = CHAT_DB.recent(st.session_state.get("session_id", "default"), limit=MAX_HISTORY_MSGS)
+#     with messages_box:
+#         for m in history_msgs:
+#             with st.chat_message("user" if m["role"] == "user" else "assistant"):
+#                 st.write(m["content"])
+
+#     # --- Custom input form rendered AFTER messages (so it stays below) ---
+#     with st.form("chat_form", clear_on_submit=True):
+#         user_query = st.text_area("your query",
+#             key="chat_text",
+#             height=80,
+#             placeholder="Type your question and press Send"
+#         )
+
+#         # If you have uploads in this column, keep the uploader here too
+#         uploaded_files = st.file_uploader("Attach files (optional)", accept_multiple_files=True)
+
+#         send = st.form_submit_button("Send", type="primary", use_container_width=False)
+
+#     if send and user_query and user_query.strip():
+#         # Prepare uploads as bytes for the model
+#         uploads_payload = []
+#         if uploaded_files:
+#             for f in uploaded_files:
+#                 try:
+#                     uploads_payload.append({
+#                         "bytes": f.getvalue(),
+#                         "mime": f.type or "application/octet-stream",
+#                         "name": f.name,
+#                     })
+#                 except Exception as e:
+#                     st.warning(f"Failed to read {getattr(f, 'name', 'file')}: {e}")
+
+#         # Echo the user's message ABOVE the input (in the messages container)
+#         with messages_box:
+#             with st.chat_message("user"):
+#                 st.write(user_query)
+
+#         with st.spinner("Thinking…"):
+#             resp = resultDocuments(
+#                 query=user_query,
+#                 extracted_text=extracted_text,
+#                 uploads=uploads_payload,
+#                 model=selected_label,  # pass the label; router resolves it
+#                 session_id=st.session_state.get("session_id", "default"),
+#             )
+
+#         # Show assistant reply ABOVE the input (still inside the messages container)
+#         with messages_box:
+#             with st.chat_message("assistant"):
+#                 st.write(resp["text"])
+
+#         # Save latest sources for right column display
+#         st.session_state["last_sources"] = resp.get("sources", [])
+
+#         # Optional: if your DB doesn't automatically persist both sides, save here
+#         # CHAT_DB.append(st.session_state["session_id"], role="user", content=user_query)
+#         # CHAT_DB.append(st.session_state["session_id"], role="assistant", content=resp["text"])
+
+#         # Optional: scroll to bottom after response
+#         st.markdown("<script>window.scrollTo(0, document.body.scrollHeight);</script>", unsafe_allow_html=True)
 
 with col_docs:
     st.markdown("### 📚 Retrieved Documents")
