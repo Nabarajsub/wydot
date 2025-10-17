@@ -1,4 +1,7 @@
 fastapi
+streamlit==1.38.0
+protobuf==3.20.3
+grpcio==1.62.2
 uvicorn
 langchain
 langchain-openai
@@ -29,5 +32,3 @@ audio-recorder-streamlit
 streamlit
 google-genai
 google-auth
-protobuf==3.20.3
-grpcio==1.62.2
