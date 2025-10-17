@@ -21,3 +21,8 @@ google-generativeai
 google-genai
 pydub
 pdf2image
+google-genai
+google-auth
+pymilvus
+python-dotenv
+audio-recorder-streamlit
