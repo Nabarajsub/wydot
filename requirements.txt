@@ -26,3 +26,8 @@ google-auth
 pymilvus
 python-dotenv
 audio-recorder-streamlit
+streamlit
+google-genai
+google-auth
+protobuf==3.20.3
+grpcio==1.62.2
